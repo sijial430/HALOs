@@ -32,6 +32,7 @@ from .utils import rank0_print, on_rank0, delete_dict
 import pandas as pd
 import numpy as np
 import hashlib
+import ast
 
 
 @dataclass
@@ -532,8 +533,6 @@ def get_ultrafeedback_armorm(split: str) -> Dataset:
         i, j = data[key].num_generations() - 2, data[key].num_generations() - 1
         data[key].pairs.append((i, j))
         data[key].sft_index = 0
-        # generation with max score was set as chosen; one with min score was set as rejected
-        data[key].scores.extend([max(row['all_rm_scores']), min(row['all_rm_scores'])])
         data[key].dataset_name = data.name
         data[key].remove_extra_spaces()
 
@@ -562,8 +561,6 @@ def get_ultrafeedback_armorm_gemma(split: str) -> Dataset:
         i, j = data[key].num_generations() - 2, data[key].num_generations() - 1
         data[key].pairs.append((i, j))
         data[key].sft_index = 0
-        # generation with max score was set as chosen; one with min score was set as rejected
-        data[key].scores.extend([max(row['all_rm_scores']), min(row['all_rm_scores'])])
         data[key].dataset_name = data.name
         data[key].remove_extra_spaces()
 
@@ -590,16 +587,7 @@ def get_ultrachat(split: str) -> Dataset:
 
 
 def get_s1k_11(split: str = "train") -> Dataset:
-    """
-    Load the Ultrafeedback (binarized) dataset from Huggingface and convert it into to a Dataset.
-    For this dataset, the SFT text is the preferred response.
-
-    Args:
-        - split: 'train'
-
-    Returns:   
-        A Dataset instance.
-    """
+    """Load s1K-1.1 dataset."""
     if split != 'train':
         split = 'train'
         print(f"Warning: s1K-1.1 only has a 'train' split but requested '{split}' split. Using 'train' split.")
@@ -621,6 +609,133 @@ def get_s1k_11(split: str = "train") -> Dataset:
         }])
         data[key].dataset_name = data.name
         data[key].sft_index = 0
+        ### Make it work with KTO in paired format ###
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": "<|im_start|>think\n" + row['gemini_thinking_trajectory'] + "\n<|im_start|>answer\n" + row['gemini_attempt']
+        }])
+        data[key].pairs.append((0, 1))
+    return data
+
+
+
+def get_mathstepdpo(split: str = "train") -> Dataset:
+    """Load mathstepdpo dataset."""
+    if split != 'train':
+        split = 'train'
+        print(f"Warning: mathstepdpo only has a 'train' split but requested '{split}' split. Using 'train' split.")
+    
+    rank0_print(f'Loading xinlai/Math-Step-DPO-10K dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('xinlai/Math-Step-DPO-10K', split=split)
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing xinlai/Math-Step-DPO-10K')
+
+    data = Dataset('mathstepdpo')
+
+    for row in dataset:
+        # Create a unique key for this example (using the question)
+        key = row['prompt']
+        data[key].prompt = [{"role": "user", "content": row['prompt']}]
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": row['initial_reason_steps'] + row['full_chosen']
+        }])
+        data[key].dataset_name = data.name
+        data[key].sft_index = 0
+        ### Make it work with KTO in paired format ###
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": row['initial_reason_steps'] + row['full_rejected']
+        }])
+        data[key].pairs.append((0, 1))
+    return data
+
+def get_deepscaler(split: str) -> Dataset:
+    if split != 'train':
+        split = 'train'
+        print(f"Warning: deepscaler only has a 'train' split but requested '{split}' split. Using 'train' split.")
+    rank0_print(f'Loading deepscaler dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('agentica-org/DeepScaleR-Preview-Dataset', split=split)
+    # Deduplicate on problem
+    memory = set()
+    def is_unique(elem, column, memory):
+        if elem[column] in memory: return False
+        memory.add(elem[column])
+        return True
+    from functools import partial
+    dataset = dataset.filter(partial(is_unique, column="problem", memory=memory))
+
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing deepscaler')
+
+
+    data = Dataset('deepscaler')
+
+    for row in dataset:
+        # Create a unique key for this example (using the prompt)
+        key = row['problem']
+
+        # Convert the prompt into the new format
+        data[key].prompt = [{"role": "user", "content": row['problem']}]
+
+        # Update the dataset - should be run with ++frac_unique_undesirable=0.0
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        i, j = data[key].num_generations() - 2, data[key].num_generations() - 1
+        data[key].pairs.append((i, j))
+        data[key].sft_index = 0
+        data[key].dataset_name = data.name
+
+    return data
+
+def get_math(split: str) -> Dataset:
+    if split not in ('train', 'test'):
+        split = 'train'
+        print(f"Warning: math only has a 'train'/'test' split but requested '{split}' split. Using 'train' split.")
+    rank0_print(f'Loading math dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('simplescaling/openaimath', split=split)
+    # Deduplicate on problem
+    memory = set()
+    def is_unique(elem, column, memory):
+        if elem[column] in memory: return False
+        memory.add(elem[column])
+        return True
+    from functools import partial
+    dataset = dataset.filter(partial(is_unique, column="problem", memory=memory))
+
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing math')
+
+
+    data = Dataset('math')
+
+    for row in dataset:
+        # Create a unique key for this example (using the prompt)
+        key = row['problem']
+
+        # Convert the prompt into the new format
+        data[key].prompt = [{"role": "user", "content": row['problem']}]
+
+        # Update the dataset - should be run with ++frac_unique_undesirable=0.0
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        i, j = data[key].num_generations() - 2, data[key].num_generations() - 1
+        data[key].pairs.append((i, j))
+        data[key].sft_index = 0
+        data[key].dataset_name = data.name
+
     return data
 
 
@@ -695,4 +810,69 @@ def get_wildbench(split: str = "test") -> Dataset:
             data[key].dataset_name = data.name
             data[key].remove_extra_spaces()
 
+    return data
+
+
+def get_apps(split: str) -> Dataset:
+    if split not in ('train', 'test'):
+        split = 'train'
+        print(f"Warning: apps only has a 'train'/'test' split but requested '{split}' split. Using 'train' split.")
+    rank0_print(f'Loading apps dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('codeparrot/apps', split=split)
+
+    MAX_INPUT_OUTPUT_LENGTH = 4096
+    # filter out examples with no test cases
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing apps')
+
+    data = Dataset('apps')
+    skipped = defaultdict(int)
+
+    for row in dataset:
+        solutions = row.get('solutions', [])
+        if len(solutions) == 0:
+            content = {"input_output": row.get('input_output', ""), "solutions": ""}
+        else:
+            content = {"input_output": row.get('input_output', ""), "solutions": json.loads(solutions)[0]} # get only the first oracle solution by default
+        
+        # filter out examples with no test cases
+        if content["input_output"] == "":
+            skipped['empty_test_cases'] += 1
+            continue
+        elif len(content["input_output"]) > MAX_INPUT_OUTPUT_LENGTH:
+            skipped['test_cases_length_gt_4096'] += 1
+            continue
+            
+        try:
+            io_data = json.loads(content["input_output"])
+            if io_data["inputs"] == [] or io_data["outputs"] == []:
+                skipped['empty_test_cases'] += 1
+                continue
+        except (ValueError, json.JSONDecodeError) as e:
+            skipped['invalid_test_cases'] += 1
+            continue
+
+        # Create a unique key for this example (using the prompt)
+        key = row['question']
+        if "Imagine 13327 digits" in key: continue # skip this example because it's too long
+
+        # Convert the prompt into the new format
+        data[key].prompt = [{"role": "user", "content": row['question']}]
+        
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": json.dumps(content),
+        }])
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": json.dumps(content),
+        }])
+        i, j = data[key].num_generations() - 2, data[key].num_generations() - 1
+        data[key].pairs.append((i, j))
+        data[key].sft_index = 0
+        data[key].dataset_name = data.name
+        data[key].remove_extra_spaces()
+    
+    rank0_print(f"Loaded {len(data)} samples, skipped {sum(skipped.values())} samples.")
+    
     return data

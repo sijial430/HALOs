@@ -104,9 +104,13 @@ def main(config: DictConfig):
     # Prepare tokenizer
     tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
     accelerator.print(f'Loading tokenizer {tokenizer_name_or_path}')
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True, padding_side="left")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Set padding side for Qwen2 models to avoid Flash Attention issues
+    if "Qwen" in config.model.name_or_path:
+        assert tokenizer.padding_side == "left", "Tokenizer padding side is not left"
 
     special_tokens = []
     # Check if the tokenizer has a chat template and set a default one if it doesn't
@@ -145,7 +149,7 @@ def main(config: DictConfig):
         control_tokens=config.loss.get("control_tokens", {}),
     )
     train_iterator = data_loader_class(
-        config.train_datasets, 
+        config.train_datasets,
         tokenizer,
         split='train',
         microbatch_size=config.model.microbatch_size,
@@ -217,6 +221,11 @@ def main(config: DictConfig):
     policy_path = config.model.from_checkpoint or config.model.load_from or config.model.name_or_path
     accelerator.print(f'Loading policy from {policy_path}')
     policy = policy_cls.from_pretrained(policy_path, **policy_kwargs)
+    
+    # Set padding side on model's config if it exists
+    if hasattr(policy, 'config') and "Qwen" in config.model.name_or_path:
+        policy.config.padding_side = 'left'
+        accelerator.print(f"Set model config padding_side to {policy.config.padding_side}")
 
     if num_tokens_added:
         policy.resize_token_embeddings(len(tokenizer))
@@ -292,7 +301,12 @@ def main(config: DictConfig):
     # Load explicit reward model if necessary (e.g., for PPO)
     if config.model.reward_model.path:
         accelerator.print(f'Loading reward model from {config.model.reward_model.path}')
-        reward_tokenizer = AutoTokenizer.from_pretrained(config.model.reward_model.path)
+        if "Qwen" in config.model.reward_model.path:
+            reward_tokenizer = AutoTokenizer.from_pretrained(config.model.reward_model.path, trust_remote_code=True, padding_side="left")
+            assert reward_tokenizer.padding_side == "left", "Reward tokenizer padding side is not left"
+        else:
+            reward_tokenizer = AutoTokenizer.from_pretrained(config.model.reward_model.path)
+
         if reward_tokenizer.pad_token_id is None:
             reward_tokenizer.pad_token_id = reward_tokenizer.eos_token_id
 

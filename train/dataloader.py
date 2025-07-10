@@ -511,6 +511,9 @@ class UnpairedPreferenceDataLoader(DataLoader):
                         score = example.scores[j] if len(example.scores) > j else -1
                         flat_data.append((example, example.generations[j], 'rejected', score))
                         seen_undesirable += 1
+            elif example.dataset_name == 'group_feedback':
+                for i in range(len(example.generations)):
+                    flat_data.append((example, example.generations[i], None, example.scores[i]))
             else:
                 raise IOError("data is neither paired nor has desirability labels")
 
@@ -594,6 +597,20 @@ class GroupUnpairedPreferenceDataLoader(UnpairedPreferenceDataLoader):
     its outputs split across batches, if they occur at a boundary, but most outputs should appear
     together. This is intended for losses like GRPO.
     """
+    def get_num_training_steps(self):
+        """Override to handle group feedback data correctly."""
+        if self.n_examples:
+            num_examples = self.n_examples
+        else:
+            # Count actual examples that will be generated
+            flat_data = self.get_flat_data(list(self.full_data.keys()))
+            num_examples = len(flat_data)
+
+        if self.n_epochs is None:
+            return num_examples // self.global_batch_size
+        else:
+            return int(num_examples // self.global_batch_size) * self.n_epochs
+    
     def get_process_data(self):
         """
         Return the subset of data to be processed in the current process. 
