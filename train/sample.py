@@ -26,6 +26,7 @@ import re
 import sys
 import inspect
 from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 from transformers import AutoTokenizer
 from .dataloader import SFTDataLoader
 from .utils import set_offline_if_needed, StreamingJSONWriter
@@ -34,7 +35,7 @@ from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
 )
 from . import data as data_module
-
+import os
 
 def get_available_datasets():
     """Get list of available datasets by finding all get_* functions in dataloader.py"""
@@ -56,14 +57,49 @@ def validate_datasets(datasets):
         )
 
 
+# def paraphrase_last_user_turn(llm, tokenizer, prompt, sampling_params):
+#     user_indices = [i for i, turn in enumerate(prompt) if turn['role'] == 'user']
+#     if not user_indices:
+#         return prompt, None  # No user turn to paraphrase
+#     last_user_idx = user_indices[-1]
+#     original_user_content = prompt[last_user_idx]['content']
+#     system_prompt = "You are a helpful assistant that paraphrases instructions."
+#     user_prompt = f"""Rewrite the *content* field below in fresh wording **only**.  
+#                     DO NOT alter or remove:  
+#                     - Role names (`'user'`, `'system'`, etc.)  
+#                     - Code-block fences ``` … ``` and everything inside them  
+#                     - File names, variable names, paths, placeholders  
+#                     - Example markers such as “Q:” / “A:”, bullet order, or JSON keys  
+#                     Keep the intent, sequence, and level of detail identical.  
+#                     Return **only** the rewritten content string—no surrounding JSON, no commentary.
+
+#                     {{original_user_content}}
+#                     """
+#     chat = [
+#         {"role": "system", "content": system_prompt},
+#         {"role": "user", "content": user_prompt},
+#     ]
+#     chat_text = tokenizer.apply_chat_template(chat, tokenize=False)
+#     outputs = llm.generate([chat_text], sampling_params)
+#     paraphrased = outputs[0].outputs[0].text.strip()
+#     paraphrased = re.sub(r"<?\|(im_start|im_end)\|>?", "", paraphrased)
+#     new_prompt = copy.deepcopy(prompt)
+#     new_prompt[last_user_idx]['content'] = paraphrased
+#     return new_prompt, original_user_content
+
+
 def main(args):
     validate_datasets(args.datasets)
     set_offline_if_needed()
     
     # Load the model and tokenizer
     print(f"Loading model and tokenizer from {args.model_path}")
-    llm = LLM(model=args.model_path, tensor_parallel_size=args.gpu_count)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    if args.lora and os.path.exists(os.path.join(args.model_path, "adapter_model.safetensors")):
+        llm = LLM(model=args.base_model, tensor_parallel_size=args.gpu_count, enable_lora=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    else:
+        llm = LLM(model=args.model_path, tensor_parallel_size=args.gpu_count)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     tokenizer.chat_template = open('config/template.jinja').read()
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -97,10 +133,17 @@ def main(args):
         
         # Process the dataset in batches
         for batch in dataloader:
-            # prompt_text has already had the chat template applied
-            responses = llm.generate(batch['prompt_text'], sampling_params)
+            if args.lora:
+                responses = llm.generate(batch['prompt_text'], 
+                                        sampling_params,
+                                        lora_request=LoRARequest(
+                                            lora_name="lora-adapter",
+                                            lora_int_id=1,
+                                            lora_path=args.model_path,
+                                        ))
+            else:
+                responses = llm.generate(batch['prompt_text'], sampling_params)
 
-            # Process and write each output
             for prompt, response, dataset_name in zip(batch['prompt'], responses, batch['dataset_name']):
                 for sample_idx, sample in enumerate(response.outputs):
                     output = {
@@ -110,16 +153,14 @@ def main(args):
                         "prompt_id": prompt_idx,
                         "sample_id": sample_idx,
                         "type": "sample",
+                        "prompt": prompt,
                     }
-
-                    # for eval with alpacaeval
+                    if output["output"] == "": continue
                     if args.mode == "alpacaeval":
                         output["instruction"] = prompt[0]["content"]
                     else:
                         output["prompt"] = prompt
-
                     writer.write_item(output)
-
                 prompt_idx += 1
 
         writer.close()
@@ -151,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_prompts", type=int, default=None, help="number of prompts to sample from")
     parser.add_argument("--num_skip", type=int, default=0, help="number of prompts to skip at the beginning")
     parser.add_argument("--num_epochs", type=int, default=1, help="number of times to pass through the data (in order)")
-
+    parser.add_argument("--lora", action="store_true", help="If set, enable LoRA")
+    parser.add_argument("--base_model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct", help="Base model path for LoRA (if not specified, will try to infer from adapter config)")
     args = parser.parse_args()
     main(args)
